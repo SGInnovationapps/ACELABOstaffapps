@@ -13,6 +13,6 @@
 //   7. 下の YOUR_GAS_URL_HERE をそのURLに置き換える
 // ============================================================
 window.CONFIG = {
-  API_URL: 'https://script.google.com/macros/s/YOUR_GAS_URL_HERE/exec',
+  API_URL: 'https://script.google.com/macros/s/AKfycby7xp6LSv-nrr9S2sNY3mSCyoEx9eC5Nvrsdz8oyQimNmcRqOmR4QhFBM7KF8wc4qvn/exec',
   APP_VERSION: '2.0.0-pages'
 };
