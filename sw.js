@@ -3,7 +3,7 @@
 // オフラインでも起動できるようにする。
 // データAPI（GAS）への通信はキャッシュせず常にネットワークへ。
 
-const CACHE_VERSION = 'acelabo-v1';
+const CACHE_VERSION = 'acelabo-v2';
 const APP_SHELL = [
   './',
   './index.html',
