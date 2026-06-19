@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ACE LABO">
+<meta name="theme-color" content="#e60012">
+<title>ACE LABO 講師アプリ</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="app.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<!-- ログイン -->
+<div id="loginScreen">
+  <div class="lc">
+    <img class="llogo-img" src="logo.png" alt="ACE LABO エース・ラボ 自主性を育てる学習指導教室">
+    <div class="lsub">スタッフポータル</div>
+    <input type="email" id="loginEmail" placeholder="Gmailアドレス"
+           autocomplete="email" inputmode="email"
+           onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="lbtn" id="loginBtn" onclick="doLogin()">ログイン</button>
+    <div class="lerr" id="loginErr"></div>
+    <div class="lnote">登録済みのGmailアドレスでログインしてください。<br>不明な場合は管理者にお問い合わせください。</div>
+  </div>
+</div>
+
+<!-- ローディング -->
+<div id="loading" class="hidden">
+  <img class="ldlogo-img" src="logo.png" alt="ACE LABO">
+  <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+</div>
+
+<!-- メインアプリ -->
+<div id="app" class="hidden">
+  <header class="hd">
+    <img class="htitle-img" src="logo.png" alt="ACE LABO">
+    <div class="huser">
+      <div class="hname" id="hdrName"></div>
+      <div class="hemail" id="hdrEmail"></div>
+    </div>
+  </header>
+
+  <main class="mc">
+
+    <!-- ① 出退勤 -->
+    <div id="tab-att" class="tc">
+      <p class="sec-title">本日の勤怠</p>
+      <div class="card">
+        <div class="card-pad">
+          <div class="status-grid">
+            <div class="stat-box"><div class="stat-label">出勤</div><div class="stat-val" id="sIn">—</div></div>
+            <div class="stat-box"><div class="stat-label">退勤</div><div class="stat-val" id="sOut">—</div></div>
+            <div class="stat-box"><div class="stat-label">交通費</div><div class="stat-val" id="sFee">—</div></div>
+          </div>
+          <div class="clock-grid">
+            <button class="clock-btn ci" onclick="doClock('in')">
+              <span class="bicon">🟢</span>出勤<small>現在時刻を記録</small>
+            </button>
+            <button class="clock-btn co" onclick="doClock('out')">
+              <span class="bicon">🔴</span>退勤<small>現在時刻を記録</small>
+            </button>
+          </div>
+        </div>
+
+        <div class="sec-inner">
+          <div class="sec-label">往復交通費</div>
+          <div class="fg">
+            <label class="fl">金額（円）</label>
+            <input type="number" class="fc" id="feeInput" placeholder="例: 640" min="0" step="10" inputmode="numeric">
+          </div>
+          <button class="btn bp" onclick="saveFee()">保存</button>
+        </div>
+
+        <div class="sec-inner">
+          <div class="manual-toggle" onclick="toggleManual()">
+            <span class="manual-toggle-label">打ち忘れ報告</span>
+            <span class="toggle-arrow" id="manArrow">▼</span>
+          </div>
+          <div id="manForm" class="hidden" style="margin-top:14px">
+            <div class="fg">
+              <label class="fl">日付</label>
+              <input type="date" class="fc" id="manDate">
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+              <div><label class="fl">出勤時刻</label><input type="time" class="fc" id="manIn"></div>
+              <div><label class="fl">退勤時刻</label><input type="time" class="fc" id="manOut"></div>
+            </div>
+            <div style="font-size:12px;color:var(--mu);margin-bottom:14px">※ 同日の記録がある場合は上書きされます</div>
+            <button class="btn bp" onclick="submitManual()">記録を送信</button>
+          </div>
+        </div>
+      </div>
+
+      <p class="sec-title">勤怠履歴</p>
+      <div class="card">
+        <div id="attList"><div class="empty-state"><div class="empty-icon">📋</div><div class="empty-text">記録がありません</div></div></div>
+      </div>
+    </div>
+
+    <!-- ② 指導報告 -->
+    <div id="tab-rep" class="tc on">
+      <p class="sec-title">指導報告を登録 <span id="editModeBadge" class="edit-mode-badge hidden">✏ 本日分を編集</span></p>
+      <div class="card card-pad">
+        <div class="fg">
+          <label class="fl">担当講師</label>
+          <div class="fc fc-disp" id="repTeacher" style="border-radius:12px">—</div>
+        </div>
+        <div class="fg">
+          <label class="fl">生徒氏名</label>
+          <select class="fc" id="stuSel" onchange="onStudentChange()">
+            <option value="">— 生徒を選択 —</option>
+          </select>
+        </div>
+        <div class="stu-info" id="stuInfo">
+          <div class="stu-name" id="stuInfoName"></div>
+          <div class="stu-tags" id="stuInfoTags"></div>
+        </div>
+
+        <!-- 指導報告 / 成績 サブタブ -->
+        <div class="rsub-bar hidden" id="rsubBar">
+          <button class="rsub on" data-rsub="rep" onclick="switchRSub('rep',this)">📝 指導報告</button>
+          <button class="rsub" data-rsub="grade" onclick="switchRSub('grade',this)">📊 成績</button>
+        </div>
+
+        <!-- ─── 指導報告コンテンツ ─── -->
+        <div id="rsub-rep" class="rsub-content on">
+          <div id="materialSection" style="display:none;margin-bottom:14px">
+            <label class="fl">実施した教材（複数選択可）</label>
+            <div id="materialChecks" class="mat-check-group"></div>
+          </div>
+          <div id="homeworkSection" style="display:none;margin-bottom:14px">
+            <label class="fl">宿題（複数選択可）</label>
+            <div id="homeworkChecks" class="mat-check-group"></div>
+          </div>
+          <div class="fg">
+            <label class="fl">報告事項（任意）</label>
+            <textarea class="fc" id="repNote" placeholder="本日の指導内容、進捗、気づきなど..."></textarea>
+          </div>
+          <div class="fg">
+            <label class="fl">計画実行カード写真（任意）</label>
+            <div class="photo-area" id="photoArea" onclick="triggerCam()">
+              <input type="file" id="photoInput" accept="image/*" capture="environment"
+                     onchange="onPhotoSel(event)" onclick="event.stopPropagation()">
+              <div class="photo-ph" id="photoPH">
+                <div class="photo-ph-icon">📷</div>
+              </div>
+              <img id="photoPV" class="photo-preview hidden" alt="プレビュー">
+              <button class="photo-rm hidden" id="photoRM" onclick="removePhoto(event)">✕</button>
+            </div>
+            <div class="up-prog hidden" id="upProg">
+              <span id="upTxt">アップロード中...</span>
+              <div class="pb-wrap"><div class="pb" id="upBar"></div></div>
+            </div>
+            <div class="drive-link" id="dLink"></div>
+            <div class="existing-photo-note hidden" id="existingPhotoNote"></div>
+          </div>
+          <button class="btn bp" id="repBtn" onclick="submitReport()">報告を提出</button>
+        </div>
+
+        <!-- ─── 成績コンテンツ ─── -->
+        <div id="rsub-grade" class="rsub-content">
+          <div id="gradeMain">
+            <div id="gradeSummary" class="grade-summary hidden">
+              <div class="grade-stat grade-stat-latest">
+                <div class="grade-stat-label" id="gradeLatestLbl">最新テスト</div>
+                <div class="grade-latest-vals">
+                  <div class="grade-latest-item">
+                    <div class="grade-latest-num" id="gradeSumLatest">—</div>
+                    <div class="grade-latest-cap">合計点</div>
+                  </div>
+                  <div class="grade-latest-item">
+                    <div class="grade-latest-num" id="gradeAvgLatest">—</div>
+                    <div class="grade-latest-cap">平均点</div>
+                  </div>
+                </div>
+              </div>
+              <div class="grade-stat">
+                <div class="grade-stat-label">記録件数</div>
+                <div class="grade-stat-val" id="gradeCount">0</div>
+                <div class="grade-stat-sub">件</div>
+              </div>
+            </div>
+            <div id="gradeTableWrap" class="grade-table-wrap hidden">
+              <table class="grade-table" id="gradeTable"></table>
+            </div>
+            <div class="grade-chart-wrap">
+              <canvas id="gradeChart" role="img" aria-label="5教科の得点推移グラフ"></canvas>
+            </div>
+            <div id="gradeNoData" class="grade-empty hidden">
+              <div class="empty-icon">📊</div>
+              <div class="empty-text">まだ記録がありません<br>下のボタンから入力してください</div>
+            </div>
+            <button class="btn bp" id="gradeEntryToggle" onclick="toggleGradeForm()" style="margin-top:8px">＋ 成績入力</button>
+
+            <div id="gradeForm" class="grade-form-section hidden">
+              <div class="fg">
+                <label class="fl">生徒ID</label>
+                <div class="fc fc-disp" id="gfStudentId" style="border-radius:12px">—</div>
+              </div>
+              <div class="fg">
+                <label class="fl">学年</label>
+                <div class="fc fc-disp" id="gfGrade" style="border-radius:12px">—</div>
+              </div>
+              <div class="fg">
+                <label class="fl">テスト名</label>
+                <select class="fc" id="gfTestName"><option value="">— 選択 —</option></select>
+              </div>
+              <div class="fg">
+                <label class="fl">教科</label>
+                <select class="fc" id="gfSubject"><option value="">— 選択 —</option></select>
+              </div>
+              <div class="fg">
+                <label class="fl">得点（0〜100）</label>
+                <input type="number" class="fc" id="gfScore" min="0" max="100" placeholder="例: 85" inputmode="numeric">
+              </div>
+              <div style="font-size:32px;color:var(--mu);margin-bottom:14px;line-height:1.5">
+                ※ 同じテスト・教科の組合せが既にある場合は上書きされます
+              </div>
+              <button class="btn bp" id="gradeSaveBtn" onclick="submitGrade()">保存する</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <p class="sec-title">報告履歴</p>
+      <div class="card">
+        <div id="repList"><div class="empty-state"><div class="empty-icon">📝</div><div class="empty-text">記録がありません</div></div></div>
+      </div>
+    </div>
+
+    <!-- ③ 指導報告一覧 -->
+    <div id="tab-his" class="tc">
+      <p class="sec-title">指導報告一覧</p>
+      <div class="card card-pad">
+        <div class="fg" style="margin-bottom:0">
+          <label class="fl">生徒を選択</label>
+          <select class="fc" id="hisStuSel" onchange="loadHistoryReports()">
+            <option value="">— 生徒を選択 —</option>
+          </select>
+        </div>
+      </div>
+      <div id="hisList"><div class="empty-state"><div class="empty-icon">📋</div><div class="empty-text">生徒を選択してください</div></div></div>
+    </div>
+
+    <!-- ④ シフト -->
+    <div id="tab-shf" class="tc">
+      <div class="subtab-bar">
+        <button class="subtab on" id="subtab-hope" onclick="switchSubtab('hope',this)">シフト希望</button>
+        <button class="subtab" id="subtab-conf" onclick="switchSubtab('conf',this)">確定シフト</button>
+      </div>
+
+      <div id="subtab-hope-content" class="subtab-content on">
+        <div class="card card-pad" style="margin-top:12px">
+          <div class="cal-nav">
+            <button class="cal-nav-btn" onclick="mvMonth(-1)">‹</button>
+            <span class="cal-title" id="calTitle"></span>
+            <button class="cal-nav-btn" onclick="mvMonth(1)">›</button>
+          </div>
+          <div class="cal-grid" id="cal"></div>
+          <div class="cal-legend">
+            <div class="legend-item"><div class="legend-dot" style="background:#fff9e0"></div>16:30開講</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#fde8e8"></div>11:00開講</div>
+            <div class="legend-item"><div class="legend-dot" style="background:#ffe5cc"></div>要ヘルプ</div>
+          </div>
+          <div id="calDayDetail" class="hidden day-detail"></div>
+          <div id="calInfo" style="font-size:13px;color:var(--mu);text-align:center;margin:8px 0 12px"></div>
+          <button class="btn bp" id="shfBtn" onclick="submitShift()" disabled>日付を選択してください</button>
+        </div>
+        <p class="sec-title">申請済みシフト</p>
+        <div class="card">
+          <div id="shfList"><div class="empty-state"><div class="empty-icon">📅</div><div class="empty-text">申請がありません</div></div></div>
+        </div>
+      </div>
+
+      <div id="subtab-conf-content" class="subtab-content">
+        <div class="card card-pad" style="margin-top:12px">
+          <div class="cal-nav">
+            <button class="cal-nav-btn" onclick="mvMonthConf(-1)">‹</button>
+            <span class="cal-title" id="calTitleConf"></span>
+            <button class="cal-nav-btn" onclick="mvMonthConf(1)">›</button>
+          </div>
+          <div class="cal-grid" id="calConf"></div>
+          <div class="cal-legend">
+            <div class="legend-item"><div class="legend-dot" style="background:#d1e7dd"></div>自分が入っている日</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <nav class="tb">
+    <button class="ti on" onclick="switchTab('rep',this)"><span class="tic">📝</span>指導報告</button>
+    <button class="ti"    onclick="switchTab('att',this)"><span class="tic">⏱</span>出退勤</button>
+    <button class="ti"    onclick="switchTab('his',this)"><span class="tic">📋</span>報告一覧</button>
+    <button class="ti"    onclick="switchTab('shf',this)"><span class="tic">📅</span>シフト</button>
+  </nav>
+</div>
+
+<div class="toast" id="toast"></div>
+
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+<script>
+// PWA: Service Worker 登録 + 自動更新
+if('serviceWorker' in navigator){
+  let refreshing = false;
+  // 新しいSWが制御を引き継いだら1回だけ自動リロード
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    refreshing = true;
+    window.location.reload();
+  });
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').then((reg) => {
+      // 起動時に更新チェック
+      reg.update();
+      // 待機中の新SWがあれば即時有効化を指示
+      if (reg.waiting) reg.waiting.postMessage('SKIP_WAITING');
+      // 新SWが見つかってインストール完了したら有効化を指示
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) {
+            nw.postMessage('SKIP_WAITING');
+          }
+        });
+      });
+    }).catch((err) => console.warn('SW登録失敗:', err));
+  });
+}
+</script>
+</body>
+</html>
