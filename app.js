@@ -1,3 +1,14 @@
+// ============================================================
+// ACELABO 講師アプリ - app.js
+// version 2.2.0 (パフォーマンス最適化版)
+//
+// 【2.1.0 からの主な変更】
+//   1. 起動時のAPI呼び出しを 9往復 → 1往復（bootstrap）
+//   2. 生徒選択時の呼び出しを 2往復 → 1往復（selectStudent）
+//   3. 写真を送信前に自動縮小（3〜8MB → 200KB前後）
+//   4. 読み取り系APIのみタイムアウト＋1回リトライ
+// ============================================================
+
 // ── トークン管理 ──────────────────────────────────────────
 const TOKEN_KEY = 'acl_token';
 function getToken(){ try{ return localStorage.getItem(TOKEN_KEY)||''; }catch(e){ return ''; } }
@@ -10,7 +21,6 @@ function clearAuth(){
   }catch(e){}
 }
 
-// 認証切れ時の処理：保存情報を消してログイン画面へ戻す
 function handleAuthExpired(message){
   clearAuth();
   S.name=''; S.email='';
@@ -25,25 +35,57 @@ function handleAuthExpired(message){
 }
 
 // ── GAS Web API 通信 ──────────────────────────────────────
-// CONFIG.API_URL は config.js で定義
+// 読み取り専用API（失敗時に安全に再試行できるもの）
+const READONLY_FNS = [
+  'bootstrap','selectStudent','getStudents','getTodayReport','getReports',
+  'getReportsByStudent','getAttendance','getShifts','getSchedule',
+  'getConfirmedShifts','getTestConfig','getTestScores','loginWithEmail'
+];
+const REQ_TIMEOUT_MS = 30000;
+
 async function run(fn,...args){
   if(!window.CONFIG || !CONFIG.API_URL || CONFIG.API_URL.includes('YOUR_GAS_URL')){
     throw new Error('API URLが未設定です。config.js を確認してください');
   }
-  // simple request (CORS preflight 回避)：text/plain で POST する
+  const retriable = READONLY_FNS.indexOf(fn) >= 0;
+  const attempts = retriable ? 2 : 1;
+  let lastErr;
+  for(let i=0; i<attempts; i++){
+    try{
+      return await _post(fn,args);
+    }catch(e){
+      lastErr = e;
+      if(e && e.__auth) throw e;              // 認証エラーは再試行しない
+      if(i < attempts-1) await _sleep(700);   // 一時的な輻輳を吸収
+    }
+  }
+  throw lastErr;
+}
+
+function _sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+async function _post(fn,args){
   const body = JSON.stringify({ fn, args, token: getToken() });
+  const ctrl = (typeof AbortController!=='undefined') ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(()=>ctrl.abort(), REQ_TIMEOUT_MS) : null;
   let resp;
   try{
     resp = await fetch(CONFIG.API_URL, {
       method: 'POST',
       mode: 'cors',
-      // GAS の CORS 制約回避のため text/plain で送信
+      // GAS の CORS 制約回避のため text/plain で送信（プリフライトを起こさない）
       headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
       body,
       redirect: 'follow',
+      signal: ctrl ? ctrl.signal : undefined
     });
   }catch(networkErr){
+    if(networkErr && networkErr.name === 'AbortError'){
+      throw new Error('通信がタイムアウトしました。電波状況を確認して再試行してください');
+    }
     throw new Error('通信エラー: ' + (networkErr.message||networkErr));
+  }finally{
+    if(timer) clearTimeout(timer);
   }
   if(!resp.ok){
     throw new Error('サーバーエラー (HTTP ' + resp.status + ')');
@@ -52,10 +94,11 @@ async function run(fn,...args){
   try{ data = await resp.json(); }
   catch(parseErr){ throw new Error('レスポンス解析エラー'); }
   if(data && data.ok === false){
-    // 認証エラーはログイン画面へ誘導
     if(data.code === 'AUTH'){
       handleAuthExpired(data.error);
-      throw new Error(data.error || 'ログインが必要です');
+      const err = new Error(data.error || 'ログインが必要です');
+      err.__auth = true;
+      throw err;
     }
     throw new Error(data.error || '不明なエラー');
   }
@@ -69,11 +112,10 @@ const S={
   calY:new Date().getFullYear(),calM:new Date().getMonth(),selDate:null,
   editing:false,
   existingPhotoUrl:'',
-  // ── 成績関連 ──
-  testConfig:null,         // {students,testNames,subjects}
-  studentScores:[],        // 現在選択中の生徒のスコア
-  isTestTarget:false,      // 現在の生徒が対象生徒か
-  gradeChart:null          // Chart.jsインスタンス
+  testConfig:null,
+  studentScores:[],
+  isTestTarget:false,
+  gradeChart:null
 };
 
 // ── ログイン ──────────────────────────────────────────────
@@ -85,61 +127,69 @@ async function doLogin(){
   if(!email){errEl.textContent='メールアドレスを入力してください';return;}
   btn.disabled=true; btn.textContent='確認中...';
   try{
-    const info=await run('loginWithEmail',email);
-    setToken(info.token);
-    try{localStorage.setItem('acl_email',info.email);localStorage.setItem('acl_name',info.name);}catch(e){}
-    await startApp(info);
+    // ★ ログイン検証と初期データ取得を1往復で行う
+    const b=await run('bootstrap',email);
+    setToken(b.info.token);
+    try{
+      localStorage.setItem('acl_email',b.info.email);
+      localStorage.setItem('acl_name',b.info.name);
+    }catch(e){}
+    startApp(b);
   }catch(e){
     errEl.textContent=e.message;
+  }finally{
     btn.disabled=false; btn.textContent='ログイン';
   }
 }
 
 // ── 起動 ──────────────────────────────────────────────────
 window.addEventListener('load',async()=>{
-  let em='',nm='',tk='';
+  let em='',tk='';
   try{
     em=localStorage.getItem('acl_email')||'';
-    nm=localStorage.getItem('acl_name')||'';
     tk=getToken();
   }catch(e){}
-  // トークンと基本情報が揃っていれば自動ログインを試みる
-  if(em&&nm&&tk){
-    document.getElementById('loginScreen').classList.add('hidden');
-    document.getElementById('loading').classList.remove('hidden');
-    try{
-      // 保存済みトークンの有効性を、軽いAPI呼び出しで確認
-      // （getScheduleは個人情報を含まず副作用もないため検証に最適）
-      await run('getSchedule');
-      await startApp({ email:em, name:nm });
-    }catch(e){
-      // 認証エラーなら run() 側で既にログイン画面へ戻している
-      // それ以外（通信エラー等）の場合もここで安全側に倒す
-      clearAuth();
-      document.getElementById('loading').classList.add('hidden');
-      document.getElementById('loginScreen').classList.remove('hidden');
-    }
+  if(!em||!tk) return;
+
+  document.getElementById('loginScreen').classList.add('hidden');
+  document.getElementById('loading').classList.remove('hidden');
+  try{
+    // ★ 検証用の追加リクエストは廃止。bootstrap 1回で完結する
+    const b=await run('bootstrap',em);
+    setToken(b.info.token);   // トークンを更新（有効期限を延長）
+    try{ localStorage.setItem('acl_name',b.info.name); }catch(e){}
+    startApp(b);
+  }catch(e){
+    clearAuth();
+    document.getElementById('loading').classList.add('hidden');
+    document.getElementById('loginScreen').classList.remove('hidden');
+    const errEl=document.getElementById('loginErr');
+    if(errEl) errEl.textContent=e.message||'';
   }
 });
 
-async function startApp(info){
-  S.email=info.email; S.name=info.name;
-  document.getElementById('hdrName').textContent=info.name;
-  document.getElementById('hdrEmail').textContent=info.email;
-  document.getElementById('repTeacher').textContent=info.name;
-  document.getElementById('loading').classList.remove('hidden');
+// bootstrap の結果を受け取って画面を組み立てる（API呼び出しなし）
+function startApp(b){
+  S.email=b.info.email; S.name=b.info.name;
+  document.getElementById('hdrName').textContent=S.name;
+  document.getElementById('hdrEmail').textContent=S.email;
+  document.getElementById('repTeacher').textContent=S.name;
   document.getElementById('loginScreen').classList.add('hidden');
-  await Promise.allSettled([
-    loadStudents().catch(console.warn),
-    loadTodayStatus().catch(console.warn),
-    loadAttHistory().catch(console.warn),
-    loadShifts().catch(console.warn),
-    loadReports().catch(console.warn),
-    loadSchedule().catch(console.warn),
-    loadConfirmedShifts().catch(console.warn),
-    loadTestConfig().catch(console.warn)   // ★成績設定の読込み
-  ]);
-  renderCal(); updShfBtn();
+
+  S.students        = b.students   || [];
+  S.schedule        = b.schedule   || {};
+  S.confirmedShifts = b.confirmed  || {};
+  S.testConfig      = b.testConfig || null;
+  S.shifts          = b.shifts     || [];
+
+  renderStudentOptions();
+  applyTestConfig();
+  renderAttendance(b.attendance || []);
+  renderReports(b.reports || []);
+  renderShifts();
+  renderCal();
+  updShfBtn();
+
   document.getElementById('loading').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
 }
@@ -149,25 +199,42 @@ function jstToday(){
 }
 
 // ── 出退勤 ────────────────────────────────────────────────
-async function loadTodayStatus(){
-  const recs=await run('getAttendance',S.name);
+function renderAttendance(recs){
+  renderTodayStatus(recs);
+  renderAttHistory(recs);
+}
+async function refreshAttendance(){
+  renderAttendance(await run('getAttendance',S.name));
+}
+function renderTodayStatus(recs){
   const today=jstToday();
-  const rec=recs.find(r=>String(r.date).replace(/-/g,'/')===today);
-  if(rec){
-    setSV('sIn',rec.clockIn); setSV('sOut',rec.clockOut);
-    if(rec.fee!=='') document.getElementById('sFee').textContent='¥'+Number(rec.fee).toLocaleString();
+  resetSV('sIn'); resetSV('sOut'); resetSV('sFee');
+  const rec=(recs||[]).find(r=>String(r.date).replace(/-/g,'/')===today);
+  if(!rec) return;
+  setSV('sIn',rec.clockIn); setSV('sOut',rec.clockOut);
+  if(rec.fee!==''&&rec.fee!==undefined){
+    const el=document.getElementById('sFee');
+    el.textContent='¥'+Number(rec.fee).toLocaleString();
+    el.classList.add('ok');
   }
+}
+function resetSV(id){
+  const el=document.getElementById(id);
+  if(!el) return;
+  el.textContent='—'; el.classList.remove('ok');
 }
 function setSV(id,val){
   const el=document.getElementById(id);
-  if(val&&String(val).includes(':')){el.textContent=String(val).slice(0,5);el.classList.add('ok');}
-  else if(val){el.textContent=String(val);el.classList.add('ok');}
+  if(!el||!val) return;
+  el.textContent = String(val).includes(':') ? String(val).slice(0,5) : String(val);
+  el.classList.add('ok');
 }
 async function doClock(type){
   try{
     const r=await run(type==='in'?'clockIn':'clockOut',S.name);
     setSV(type==='in'?'sIn':'sOut',r.time);
     toast((type==='in'?'出勤':'退勤')+'打刻しました: '+r.time,'ok');
+    await refreshAttendance();
   }catch(e){toast(e.message,'ng');}
 }
 async function saveFee(){
@@ -175,20 +242,20 @@ async function saveFee(){
   if(!v||v<0){toast('交通費を入力してください','ng');return;}
   try{
     await run('addTransportFee',S.name,v);
-    document.getElementById('sFee').textContent='¥'+v.toLocaleString();
+    const el=document.getElementById('sFee');
+    el.textContent='¥'+v.toLocaleString(); el.classList.add('ok');
     document.getElementById('feeInput').value='';
     toast('交通費を保存しました','ok');
   }catch(e){toast(e.message,'ng');}
 }
-async function loadAttHistory(){
-  const recs=await run('getAttendance',S.name);
+function renderAttHistory(recs){
   const el=document.getElementById('attList');
-  if(!recs.length){el.innerHTML=emptyHTML('📋','記録がありません');return;}
+  if(!recs||!recs.length){el.innerHTML=emptyHTML('📋','記録がありません');return;}
   el.innerHTML='<div class="rlist">'+recs.map(r=>`
     <div class="ritem">
       <div>
-        <div class="ritem-main">${r.date}</div>
-        <div class="ritem-sub">${r.clockIn?'出勤 '+r.clockIn.slice(0,5):'—'}${r.clockOut?' → 退勤 '+r.clockOut.slice(0,5):''}</div>
+        <div class="ritem-main">${esc(r.date)}</div>
+        <div class="ritem-sub">${r.clockIn?'出勤 '+esc(r.clockIn.slice(0,5)):'—'}${r.clockOut?' → 退勤 '+esc(r.clockOut.slice(0,5)):''}</div>
       </div>
       <div class="ritem-right">${r.fee!==''?'¥'+Number(r.fee).toLocaleString():'—'}</div>
     </div>`).join('')+'</div>';
@@ -218,21 +285,23 @@ async function submitManual(){
     document.getElementById('manForm').classList.add('hidden');
     document.getElementById('manArrow').textContent='▼';
     document.getElementById('manArrow').classList.remove('open');
-    await loadAttHistory(); await loadTodayStatus();
+    await refreshAttendance();
   }catch(e){toast(e.message,'ng');}
 }
 
 // ── 指導報告 ──────────────────────────────────────────────
-async function loadStudents(){
-  S.students=await run('getStudents');
+function renderStudentOptions(){
   const opts='<option value="">— 生徒を選択 —</option>'+
-    S.students.map(s=>`<option value="${s.name}">${s.name}（${s.grade}）</option>`).join('');
+    S.students.map(s=>`<option value="${esc(s.name)}">${esc(s.name)}（${esc(s.grade)}）</option>`).join('');
   document.getElementById('stuSel').innerHTML=opts;
   document.getElementById('hisStuSel').innerHTML=opts;
 }
+
 async function onStudentChange(){
   const name=document.getElementById('stuSel').value;
   const card=document.getElementById('stuInfo');
+  const sel=document.getElementById('stuSel');
+
   // リセット
   S.editing=false;
   S.existingPhotoUrl='';
@@ -240,7 +309,6 @@ async function onStudentChange(){
   document.getElementById('existingPhotoNote').classList.add('hidden');
   document.getElementById('existingPhotoNote').innerHTML='';
   document.getElementById('repBtn').textContent='報告を提出';
-  // サブタブを「指導報告」に戻す
   resetRSub();
 
   if(!name){
@@ -248,27 +316,27 @@ async function onStudentChange(){
     document.getElementById('rsubBar').classList.add('hidden');
     return;
   }
-  const s=S.students.find(x=>x.name===name);if(!s)return;
+  const s=S.students.find(x=>x.name===name);
+  if(!s) return;
+
   document.getElementById('stuInfoName').textContent=s.name;
-  let tagsHtml = `<span class="stu-tag">📆 ${s.plan}</span>`;
-  if(s.note) tagsHtml += `<div class="stu-note">${s.note}</div>`;
+  let tagsHtml = `<span class="stu-tag">📆 ${esc(s.plan)}</span>`;
+  if(s.note) tagsHtml += `<div class="stu-note">${esc(s.note)}</div>`;
   document.getElementById('stuInfoTags').innerHTML = tagsHtml;
 
-  const mats = s.materials.split(',').map(m=>m.trim()).filter(Boolean);
-  const cl = document.getElementById('materialChecks');
-  cl.innerHTML = mats.map((m,i)=>`
+  const mats = (s.materials||'').split(',').map(m=>m.trim()).filter(Boolean);
+  document.getElementById('materialChecks').innerHTML = mats.map((m,i)=>`
     <label class="mat-check-label">
-      <input type="checkbox" class="mat-check" value="${m}" id="mat${i}">
-      <span class="mat-check-text">${m}</span>
+      <input type="checkbox" class="mat-check" value="${esc(m)}" id="mat${i}">
+      <span class="mat-check-text">${esc(m)}</span>
     </label>`).join('');
   document.getElementById('materialSection').style.display = mats.length ? 'block' : 'none';
 
-  const hws = s.homework ? s.homework.split(',').map(h=>h.trim()).filter(Boolean) : [];
-  const hl = document.getElementById('homeworkChecks');
-  hl.innerHTML = hws.map((h,i)=>`
+  const hws = (s.homework||'').split(',').map(h=>h.trim()).filter(Boolean);
+  document.getElementById('homeworkChecks').innerHTML = hws.map((h,i)=>`
     <label class="mat-check-label">
-      <input type="checkbox" class="mat-check hw-check" value="${h}" id="hw${i}">
-      <span class="mat-check-text">${h}</span>
+      <input type="checkbox" class="mat-check hw-check" value="${esc(h)}" id="hw${i}">
+      <span class="mat-check-text">${esc(h)}</span>
     </label>`).join('');
   document.getElementById('homeworkSection').style.display = hws.length ? 'block' : 'none';
   card.classList.add('on');
@@ -276,62 +344,110 @@ async function onStudentChange(){
   removePhoto(null);
   document.getElementById('repNote').value='';
 
-  // 本日の既存報告を取得して復元
+  // ★ 当日報告 + 成績を1往復で取得
+  sel.disabled = true;
+  let data = null;
   try{
-    const existing = await run('getTodayReport', name);
-    if(existing){
-      S.editing = true;
-      S.existingPhotoUrl = existing.photoUrl || '';
-      const matSet = new Set(existing.materials || []);
-      document.querySelectorAll('#materialChecks .mat-check').forEach(c=>{
-        if(matSet.has(c.value)) c.checked = true;
-      });
-      const hwSet = new Set(existing.homework || []);
-      document.querySelectorAll('#homeworkChecks .hw-check').forEach(c=>{
-        if(hwSet.has(c.value)) c.checked = true;
-      });
-      document.getElementById('repNote').value = existing.note || '';
-      if(existing.photoUrl){
-        const note = document.getElementById('existingPhotoNote');
-        note.innerHTML = `📂 既存の写真あり <a href="${existing.photoUrl}" target="_blank">ドライブで確認</a><br>新しい写真を撮影すると上書きされます`;
-        note.classList.remove('hidden');
-      }
-      const editBadge = document.getElementById('editModeBadge');
-      if(existing.teacherName && existing.teacherName !== S.name){
-        editBadge.textContent = `✏ ${existing.teacherName}の記録を編集`;
-      }else{
-        editBadge.textContent = '✏ 本日分を編集';
-      }
-      editBadge.classList.remove('hidden');
-      document.getElementById('repBtn').textContent='報告を更新';
-    }
-  }catch(e){ console.warn('既存報告取得エラー:', e); }
+    data = await run('selectStudent', name);
+  }catch(e){
+    console.warn('生徒データ取得エラー:', e);
+    toast('データの取得に失敗しました','ng');
+  }finally{
+    sel.disabled = false;
+  }
+  // 取得中に別の生徒へ切り替えられていたら破棄
+  if(document.getElementById('stuSel').value !== name) return;
 
-  // 成績データ読込み（生徒変更時）
-  await loadStudentGrades(name);
+  applyTodayReport(data && data.today);
+  applyStudentGrades(name, (data && data.scores) || []);
 }
 
-let photoB64=null,photoFile=null,photoUrl=null;
+function applyTodayReport(existing){
+  if(!existing) return;
+  S.editing = true;
+  S.existingPhotoUrl = existing.photoUrl || '';
+  const matSet = {};
+  (existing.materials||[]).forEach(m=>matSet[m]=1);
+  document.querySelectorAll('#materialChecks .mat-check').forEach(c=>{
+    if(matSet[c.value]) c.checked = true;
+  });
+  const hwSet = {};
+  (existing.homework||[]).forEach(h=>hwSet[h]=1);
+  document.querySelectorAll('#homeworkChecks .hw-check').forEach(c=>{
+    if(hwSet[c.value]) c.checked = true;
+  });
+  document.getElementById('repNote').value = existing.note || '';
+  if(existing.photoUrl){
+    const note = document.getElementById('existingPhotoNote');
+    note.innerHTML = `📂 既存の写真あり <a href="${esc(existing.photoUrl)}" target="_blank">ドライブで確認</a><br>新しい写真を撮影すると上書きされます`;
+    note.classList.remove('hidden');
+  }
+  const editBadge = document.getElementById('editModeBadge');
+  editBadge.textContent = (existing.teacherName && existing.teacherName !== S.name)
+    ? `✏ ${existing.teacherName}の記録を編集`
+    : '✏ 本日分を編集';
+  editBadge.classList.remove('hidden');
+  document.getElementById('repBtn').textContent='報告を更新';
+}
+
+// ── 写真（送信前に自動縮小） ──────────────────────────────
+let photoB64=null,photoMime='image/jpeg',photoUrl=null;
+
 function triggerCam(){document.getElementById('photoInput').click();}
-function onPhotoSel(e){
-  const f=e.target.files[0];if(!f)return;
-  photoFile=f;photoUrl=null;
-  document.getElementById('dLink').innerHTML='';
-  const rd=new FileReader();
-  rd.onload=ev=>{
-    photoB64=ev.target.result;
-    const pv=document.getElementById('photoPV');
-    pv.src=photoB64;pv.classList.remove('hidden');
-    document.getElementById('photoRM').classList.remove('hidden');
-    const pa=document.getElementById('photoArea');
-    pa.classList.add('has-photo');pa.style.padding='0';
-    document.getElementById('photoPH').classList.add('hidden');
-  };
-  rd.readAsDataURL(f);
+
+// スマホのカメラ写真は3〜8MB。Base64化で約1.33倍になり、
+// そのまま送るとタイムアウトの主因になるため縮小してから送る。
+function shrinkImage(file, maxW, quality){
+  maxW = maxW || 1280; quality = quality || 0.75;
+  return new Promise((resolve,reject)=>{
+    const rd=new FileReader();
+    rd.onerror=()=>reject(new Error('画像を読み込めませんでした'));
+    rd.onload=ev=>{
+      const img=new Image();
+      img.onerror=()=>reject(new Error('画像を解析できませんでした'));
+      img.onload=()=>{
+        try{
+          const sc=Math.min(1, maxW/img.width);
+          const c=document.createElement('canvas');
+          c.width =Math.max(1, Math.round(img.width *sc));
+          c.height=Math.max(1, Math.round(img.height*sc));
+          const g=c.getContext('2d');
+          g.fillStyle='#fff'; g.fillRect(0,0,c.width,c.height);
+          g.drawImage(img,0,0,c.width,c.height);
+          resolve(c.toDataURL('image/jpeg', quality));
+        }catch(err){
+          resolve(ev.target.result);   // 失敗時は原寸で続行
+        }
+      };
+      img.src=ev.target.result;
+    };
+    rd.readAsDataURL(file);
+  });
 }
+
+async function onPhotoSel(e){
+  const f=e.target.files[0];
+  if(!f) return;
+  photoUrl=null;
+  document.getElementById('dLink').innerHTML='';
+  try{
+    photoB64 = await shrinkImage(f, 1280, 0.75);
+    photoMime = 'image/jpeg';
+  }catch(err){
+    toast('写真の処理に失敗しました','ng');
+    return;
+  }
+  const pv=document.getElementById('photoPV');
+  pv.src=photoB64; pv.classList.remove('hidden');
+  document.getElementById('photoRM').classList.remove('hidden');
+  const pa=document.getElementById('photoArea');
+  pa.classList.add('has-photo'); pa.style.padding='0';
+  document.getElementById('photoPH').classList.add('hidden');
+}
+
 function removePhoto(e){
   if(e)e.stopPropagation();
-  photoB64=null;photoFile=null;photoUrl=null;
+  photoB64=null; photoUrl=null; photoMime='image/jpeg';
   const inp=document.getElementById('photoInput');
   if(inp) inp.value='';
   const pv=document.getElementById('photoPV');pv.classList.add('hidden');pv.src='';
@@ -339,9 +455,13 @@ function removePhoto(e){
   const pa=document.getElementById('photoArea');
   pa.classList.remove('has-photo');pa.style.padding='';
   document.getElementById('photoPH').classList.remove('hidden');
-  document.getElementById('upProg').classList.add('hidden');
+  const prog=document.getElementById('upProg');
+  prog.classList.add('hidden');
+  document.getElementById('upBar').style.background='';
+  document.getElementById('upBar').style.width='0';
   document.getElementById('dLink').innerHTML='';
 }
+
 async function uploadPhoto(sName){
   if(!photoB64)return null;
   if(photoUrl)return photoUrl;
@@ -350,18 +470,18 @@ async function uploadPhoto(sName){
   let p=0;const tk=setInterval(()=>{p=Math.min(p+7,85);bar.style.width=p+'%';},200);
   try{
     const b64=photoB64.split(',')[1];
-    const mime=photoFile?photoFile.type:'image/jpeg';
     const fn=`指導報告_${sName}_${new Date().toISOString().slice(0,16).replace(/[-T:]/g,'')}.jpg`;
-    const r=await run('uploadPhotoToDrive',b64,mime,fn,sName);
+    const r=await run('uploadPhotoToDrive',b64,photoMime,fn,sName);
     clearInterval(tk);bar.style.width='100%';txt.textContent='アップロード完了';
     photoUrl=r.fileUrl;
-    document.getElementById('dLink').innerHTML=`<a href="${r.fileUrl}" target="_blank">📂 ドライブで確認</a>`;
+    document.getElementById('dLink').innerHTML=`<a href="${esc(r.fileUrl)}" target="_blank">📂 ドライブで確認</a>`;
     return r.fileUrl;
   }catch(err){
     clearInterval(tk);bar.style.background='var(--ng)';txt.textContent='失敗: '+err.message;
     return null;
   }
 }
+
 async function submitReport(){
   const sName=document.getElementById('stuSel').value;
   if(!sName){toast('生徒を選択してください','ng');return;}
@@ -375,6 +495,7 @@ async function submitReport(){
     const hwChecked=Array.from(document.querySelectorAll('.hw-check:checked')).map(c=>c.value);
     const photoForServer = pu || S.existingPhotoUrl || '';
     const result = await run('addReport',S.name,sName,checked,hwChecked,note,photoForServer);
+
     document.getElementById('repNote').value='';
     document.getElementById('stuSel').value='';
     document.getElementById('stuInfo').classList.remove('on');
@@ -385,26 +506,33 @@ async function submitReport(){
     document.getElementById('editModeBadge').classList.add('hidden');
     document.getElementById('existingPhotoNote').classList.add('hidden');
     document.getElementById('existingPhotoNote').innerHTML='';
-    document.getElementById('repBtn').textContent='報告を提出';
     S.editing=false; S.existingPhotoUrl='';
     removePhoto(null);
+    resetRSub();
     toast(result&&result.updated ? '本日の報告を更新しました' : '指導報告を提出しました','ok');
-    await loadReports();
-  }catch(e){toast(e.message,'ng');}
-  finally{btn.disabled=false; if(btn.textContent.indexOf('送信中')>=0) btn.textContent = wasEditing?'報告を更新':'報告を提出';}
+    renderReports(await run('getReports',S.name));
+  }catch(e){
+    toast(e.message,'ng');
+  }finally{
+    btn.disabled=false;
+    btn.textContent = document.getElementById('stuSel').value
+      ? (wasEditing?'報告を更新':'報告を提出')
+      : '報告を提出';
+  }
 }
-async function loadReports(){
-  const recs=await run('getReports',S.name);
+
+function renderReports(recs){
   const el=document.getElementById('repList');
-  if(!recs.length){el.innerHTML=emptyHTML('📝','本日の報告はありません');return;}
+  if(!recs||!recs.length){el.innerHTML=emptyHTML('📝','本日の報告はありません');return;}
   el.innerHTML='<div class="rlist">'+recs.map(r=>{
-    const link=r.photoUrl?` <a href="${r.photoUrl}" target="_blank" style="font-size:18px;color:var(--ok)">📂</a>`:'';
-    const mats=r.materials?`<div class="ritem-sub" style="color:var(--acc)">✔ ${r.materials}</div>`:'';
-    const hws=r.homework?`<div class="ritem-sub" style="color:#8b5cf6">📚 ${r.homework}</div>`:'';
+    const link=r.photoUrl?` <a href="${esc(r.photoUrl)}" target="_blank" style="font-size:18px;color:var(--ok)">📂</a>`:'';
+    const mats=r.materials?`<div class="ritem-sub" style="color:var(--acc)">✔ ${esc(r.materials)}</div>`:'';
+    const hws=r.homework?`<div class="ritem-sub" style="color:#8b5cf6">📚 ${esc(r.homework)}</div>`:'';
+    const ts=String(r.timestamp||'').slice(0,16);
     return `<div class="ritem"><div>
-      <div class="ritem-main">${r.studentName}${link}</div>
+      <div class="ritem-main">${esc(r.studentName)}${link}</div>
       ${mats}${hws}
-      <div class="ritem-sub">${r.timestamp.slice(0,16)}${r.note?' — '+r.note.slice(0,24):''}</div>
+      <div class="ritem-sub">${esc(ts)}${r.note?' — '+esc(r.note.slice(0,24)):''}</div>
     </div></div>`;
   }).join('')+'</div>';
 }
@@ -412,25 +540,22 @@ async function loadReports(){
 // ============================================================
 // ★★★ 成績（定期テスト）機能 ★★★
 // ============================================================
-async function loadTestConfig(){
-  S.testConfig = await run('getTestConfig');
-  // ドロップダウン初期化
+function applyTestConfig(){
+  if(!S.testConfig) return;
   const tnSel = document.getElementById('gfTestName');
   tnSel.innerHTML = '<option value="">— 選択 —</option>' +
-    S.testConfig.testNames.map(t=>`<option value="${t}">${t}</option>`).join('');
+    S.testConfig.testNames.map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join('');
   const subSel = document.getElementById('gfSubject');
   subSel.innerHTML = '<option value="">— 選択 —</option>' +
-    S.testConfig.subjects.map(s=>`<option value="${s}">${s}</option>`).join('');
+    S.testConfig.subjects.map(s=>`<option value="${esc(s)}">${esc(s)}</option>`).join('');
 }
 
-// 指導報告/成績サブタブ切替
 function switchRSub(id, el){
   document.querySelectorAll('.rsub').forEach(t=>t.classList.remove('on'));
   document.querySelectorAll('.rsub-content').forEach(t=>t.classList.remove('on'));
   el.classList.add('on');
   document.getElementById('rsub-'+id).classList.add('on');
   if(id==='grade' && S.isTestTarget){
-    // チャート描画は表示後に
     setTimeout(()=>renderGradeChart(), 60);
   }
 }
@@ -440,47 +565,34 @@ function resetRSub(){
   const repBtn = document.querySelector('.rsub[data-rsub="rep"]');
   if(repBtn) repBtn.classList.add('on');
   document.getElementById('rsub-rep').classList.add('on');
-  // 成績フォーム閉じる
   closeGradeForm();
 }
 
-// 生徒選択時に呼ばれる
-async function loadStudentGrades(studentName){
+// selectStudent で取得済みのスコアを反映（API呼び出しなし）
+function applyStudentGrades(studentName, scores){
   const rsubBar = document.getElementById('rsubBar');
   if(!S.testConfig){
-    S.isTestTarget = false;
+    S.isTestTarget=false; S.studentScores=[];
     rsubBar.classList.add('hidden');
     return;
   }
   const testStudent = S.testConfig.students.find(s=>s.name===studentName);
   S.isTestTarget = !!testStudent;
 
-  // 対象外の生徒にはサブタブ自体を出さない（指導報告のみ表示）
   if(!S.isTestTarget){
     rsubBar.classList.add('hidden');
     resetRSub();
     S.studentScores = [];
     return;
   }
-  // 対象の生徒：サブタブバーを表示
   rsubBar.classList.remove('hidden');
   document.getElementById('gradeMain').classList.remove('hidden');
-
-  // 生徒情報をフォームへ反映
   document.getElementById('gfStudentId').textContent = testStudent.id;
   document.getElementById('gfGrade').textContent = testStudent.grade;
 
-  try{
-    S.studentScores = await run('getTestScores', studentName);
-  }catch(e){
-    console.warn('成績取得エラー:', e);
-    S.studentScores = [];
-  }
-
-  // サマリ・表を更新
+  S.studentScores = scores || [];
   updateGradeSummary();
   renderGradeTable();
-  // 成績タブが現在アクティブなら即時描画
   if(document.getElementById('rsub-grade').classList.contains('on')){
     setTimeout(()=>renderGradeChart(), 60);
   }
@@ -495,13 +607,10 @@ function updateGradeSummary(){
   const lblEl = document.getElementById('gradeLatestLbl');
   if(!scores.length){
     summary.classList.add('hidden');
-    sumEl.textContent = '—';
-    avgEl.textContent = '—';
-    lblEl.textContent = '最新テスト';
+    sumEl.textContent='—'; avgEl.textContent='—'; lblEl.textContent='最新テスト';
     return;
   }
   summary.classList.remove('hidden');
-  // 最新テスト（テスト名の並び順で最後に得点があるもの）
   const testOrder = (S.testConfig && S.testConfig.testNames) || [];
   let latestTest = null;
   for(let i=testOrder.length-1; i>=0; i--){
@@ -512,21 +621,16 @@ function updateGradeSummary(){
     const latestScores = scores.filter(s=>s.testName===latestTest && typeof s.score==='number');
     if(latestScores.length){
       const total = latestScores.reduce((a,b)=>a+b.score,0);
-      const avg   = total / latestScores.length;
       sumEl.textContent = total;
-      avgEl.textContent = avg.toFixed(1);
+      avgEl.textContent = (total/latestScores.length).toFixed(1);
     }else{
-      sumEl.textContent = '—';
-      avgEl.textContent = '—';
+      sumEl.textContent='—'; avgEl.textContent='—';
     }
   }else{
-    lblEl.textContent = '最新テスト';
-    sumEl.textContent = '—';
-    avgEl.textContent = '—';
+    lblEl.textContent='最新テスト'; sumEl.textContent='—'; avgEl.textContent='—';
   }
 }
 
-// ── 成績表の描画（行=教科 / 列=テスト名 + 合計・平均行） ──
 function renderGradeTable(){
   const table = document.getElementById('gradeTable');
   const wrap  = document.getElementById('gradeTableWrap');
@@ -537,7 +641,7 @@ function renderGradeTable(){
 
   if(!scores.length){
     wrap.classList.add('hidden');
-    table.innerHTML = '';
+    table.innerHTML='';
     return;
   }
   wrap.classList.remove('hidden');
@@ -547,45 +651,39 @@ function renderGradeTable(){
     return (r && typeof r.score==='number') ? r.score : null;
   };
 
-  // ヘッダー
   let html = '<thead><tr><th class="gt-subj">教科</th>' +
-    tests.map(t=>`<th>${t}</th>`).join('') + '</tr></thead><tbody>';
+    tests.map(t=>`<th>${esc(t)}</th>`).join('') + '</tr></thead><tbody>';
 
-  // 教科ごとの行
   subjects.forEach(subj=>{
-    html += `<tr><th class="gt-subj">${subj}</th>`;
+    html += `<tr><th class="gt-subj">${esc(subj)}</th>`;
     tests.forEach(t=>{
       const v = get(subj, t);
-      html += (v===null)
-        ? '<td class="gt-empty">−</td>'
-        : `<td class="gt-score">${v}</td>`;
+      html += (v===null) ? '<td class="gt-empty">−</td>' : `<td class="gt-score">${v}</td>`;
     });
     html += '</tr>';
   });
   html += '</tbody>';
 
-  // フッター（合計・平均）
   let sumRow = '<tr><td class="gt-foot-lbl">合計</td>';
   let avgRow = '<tr><td class="gt-foot-lbl">平均</td>';
   tests.forEach(t=>{
     const vals = subjects.map(s=>get(s,t)).filter(v=>v!==null);
     if(vals.length){
       const total = vals.reduce((a,b)=>a+b,0);
-      const avg   = total / vals.length;
       sumRow += `<td class="gt-sum">${total}</td>`;
-      avgRow += `<td class="gt-avg">${avg.toFixed(1)}</td>`;
+      avgRow += `<td class="gt-avg">${(total/vals.length).toFixed(1)}</td>`;
     }else{
       sumRow += '<td class="gt-empty">−</td>';
       avgRow += '<td class="gt-empty">−</td>';
     }
   });
-  sumRow += '</tr>'; avgRow += '</tr>';
+  sumRow += '</tr>';
+  avgRow += '</tr>';
   html += `<tfoot>${sumRow}${avgRow}</tfoot>`;
 
   table.innerHTML = html;
 }
 
-// 教科ごとのカラー（5教科想定 + 余裕）
 const SUBJECT_COLORS = {
   '英語':'#e94560','数学':'#1d9e75','国語':'#378add',
   '理科':'#ef9f27','社会':'#7f77dd'
@@ -594,17 +692,13 @@ const FALLBACK_COLORS = ['#e94560','#1d9e75','#378add','#ef9f27','#7f77dd','#d45
 
 function renderGradeChart(){
   const ctx = document.getElementById('gradeChart');
-  if(!ctx || !S.testConfig){ return; }
-  if(typeof Chart==='undefined'){
-    console.warn('Chart.js未ロード');
-    return;
-  }
+  if(!ctx || !S.testConfig) return;
+  if(typeof Chart==='undefined'){ console.warn('Chart.js未ロード'); return; }
+
   const labels   = S.testConfig.testNames;
   const subjects = S.testConfig.subjects;
   const scores   = S.studentScores || [];
-  const hasAny   = scores.length > 0;
-
-  document.getElementById('gradeNoData').classList.toggle('hidden', hasAny);
+  document.getElementById('gradeNoData').classList.toggle('hidden', scores.length>0);
 
   const datasets = subjects.map((subj, i) => {
     const color = SUBJECT_COLORS[subj] || FALLBACK_COLORS[i % FALLBACK_COLORS.length];
@@ -614,13 +708,9 @@ function renderGradeChart(){
         const r = scores.find(s=>s.subject===subj && s.testName===t);
         return r ? r.score : null;
       }),
-      borderColor: color,
-      backgroundColor: color,
-      tension: 0.25,
-      spanGaps: true,
-      borderWidth: 2.5,
-      pointRadius: 4,
-      pointHoverRadius: 6
+      borderColor: color, backgroundColor: color,
+      tension: 0.25, spanGaps: true, borderWidth: 2.5,
+      pointRadius: 4, pointHoverRadius: 6
     };
   });
 
@@ -631,41 +721,30 @@ function renderGradeChart(){
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: false,
       interaction: { mode: 'index', intersect: false },
       scales: {
-        y: {
-          min: 0, max: 100,
-          ticks: { stepSize: 20, font: { size: 12 }, color: '#5f5e5a' },
-          grid: { color: 'rgba(0,0,0,0.06)' }
-        },
-        x: {
-          ticks: { font: { size: 12 }, color: '#5f5e5a', autoSkip: false, maxRotation: 0 },
-          grid: { display: false }
-        }
+        y: { min:0, max:100,
+             ticks:{stepSize:20,font:{size:12},color:'#5f5e5a'},
+             grid:{color:'rgba(0,0,0,0.06)'} },
+        x: { ticks:{font:{size:12},color:'#5f5e5a',autoSkip:false,maxRotation:0},
+             grid:{display:false} }
       },
       plugins: {
-        legend: {
-          position: 'bottom',
-          labels: { font: { size: 13 }, boxWidth: 14, padding: 10, color: '#1c1c1e' }
-        },
-        tooltip: {
-          titleFont: { size: 13 }, bodyFont: { size: 13 },
-          padding: 10
-        }
+        legend:{position:'bottom',labels:{font:{size:13},boxWidth:14,padding:10,color:'#1c1c1e'}},
+        tooltip:{titleFont:{size:13},bodyFont:{size:13},padding:10}
       }
     }
   });
 }
 
-// 成績入力フォーム開閉
 function toggleGradeForm(){
   const form = document.getElementById('gradeForm');
   const btn  = document.getElementById('gradeEntryToggle');
   if(form.classList.contains('hidden')){
     form.classList.remove('hidden');
-    btn.textContent = '✕ キャンセル';
-    btn.classList.remove('bp');
-    btn.classList.add('bs');
+    btn.textContent='✕ キャンセル';
+    btn.classList.remove('bp'); btn.classList.add('bs');
   }else{
     closeGradeForm();
   }
@@ -674,15 +753,13 @@ function closeGradeForm(){
   const form = document.getElementById('gradeForm');
   const btn  = document.getElementById('gradeEntryToggle');
   form.classList.add('hidden');
-  btn.textContent = '＋ 成績入力';
-  btn.classList.remove('bs');
-  btn.classList.add('bp');
-  document.getElementById('gfTestName').value = '';
-  document.getElementById('gfSubject').value  = '';
-  document.getElementById('gfScore').value    = '';
+  btn.textContent='＋ 成績入力';
+  btn.classList.remove('bs'); btn.classList.add('bp');
+  document.getElementById('gfTestName').value='';
+  document.getElementById('gfSubject').value='';
+  document.getElementById('gfScore').value='';
 }
 
-// 成績登録
 async function submitGrade(){
   const studentName = document.getElementById('stuSel').value;
   if(!studentName){ toast('生徒を選択してください','ng'); return; }
@@ -696,20 +773,28 @@ async function submitGrade(){
 
   if(!testName){ toast('テスト名を選択してください','ng'); return; }
   if(!subject){  toast('教科を選択してください','ng'); return; }
-  if(scoreRaw==='' || scoreRaw===null){ toast('得点を入力してください','ng'); return; }
+  if(scoreRaw===''||scoreRaw===null){ toast('得点を入力してください','ng'); return; }
   const score = Number(scoreRaw);
-  if(isNaN(score) || score<0 || score>100){ toast('得点は0〜100の数値で入力してください','ng'); return; }
+  if(isNaN(score)||score<0||score>100){ toast('得点は0〜100の数値で入力してください','ng'); return; }
 
   const btn = document.getElementById('gradeSaveBtn');
   btn.disabled = true; btn.innerHTML = '<span class="sp"></span> 保存中...';
   try{
     const r = await run('addTestScore',
-      testStudent.id, testStudent.name, testStudent.grade,
-      testName, subject, score);
+      testStudent.id, testStudent.name, testStudent.grade, testName, subject, score);
     toast(r.updated ? '得点を更新しました' : '得点を記録しました', 'ok');
     closeGradeForm();
-    // 再読み込み
-    await loadStudentGrades(studentName);
+    // ローカル状態を更新（再取得の往復を省く）
+    const idx = S.studentScores.findIndex(s=>s.testName===testName && s.subject===subject);
+    if(idx>=0){ S.studentScores[idx].score = score; }
+    else{
+      S.studentScores.push({
+        studentId:testStudent.id, studentName:testStudent.name, grade:testStudent.grade,
+        testName:testName, subject:subject, score:score
+      });
+    }
+    updateGradeSummary();
+    renderGradeTable();
     renderGradeChart();
   }catch(e){
     toast(e.message,'ng');
@@ -719,11 +804,6 @@ async function submitGrade(){
 }
 
 // ── シフト ────────────────────────────────────────────────
-async function loadSchedule(){S.schedule=await run('getSchedule');}
-async function loadConfirmedShifts(){
-  S.confirmedShifts=await run('getConfirmedShifts');
-}
-
 function switchSubtab(id,el){
   document.querySelectorAll('.subtab').forEach(t=>t.classList.remove('on'));
   document.querySelectorAll('.subtab-content').forEach(t=>t.classList.remove('on'));
@@ -744,6 +824,7 @@ function renderCalConf(){
   document.getElementById('calTitleConf').textContent=y+'年 '+(m+1)+'月';
   const first=new Date(y,m,1).getDay(),days=new Date(y,m+1,0).getDate();
   const today=new Date();
+  const myLast=(S.name||'').split(/[\s　]/)[0];
   let h=['日','月','火','水','木','金','土'].map(d=>`<div class="cal-head">${d}</div>`).join('');
   for(let i=0;i<first;i++)h+='<div class="cal-day ce"></div>';
   for(let d=1;d<=days;d++){
@@ -752,13 +833,12 @@ function renderCalConf(){
     const isT=dt.toDateString()===today.toDateString();
     const isP=dt<new Date(today.toDateString());
     const names=S.confirmedShifts[ds]||[];
-    const isMine=names.includes(S.name.split(/[\s　]/)[0]);
+    const isMine=names.indexOf(myLast)>=0;
     let c='cal-day';
     if(isP)c+=' cp'; else if(isT)c+=' ct';
     if(isMine)c+=' conf-mine';
-    const nameLabels=names.map(n=>`<span class="conf-name">${n}</span>`).join('');
-    h+=`<div class="${c}" style="flex-direction:column;gap:1px;padding:2px">`+
-       `<span>${d}</span>${nameLabels}</div>`;
+    const nameLabels=names.map(n=>`<span class="conf-name">${esc(n)}</span>`).join('');
+    h+=`<div class="${c}" style="flex-direction:column;gap:1px;padding:2px"><span>${d}</span>${nameLabels}</div>`;
   }
   document.getElementById('calConf').innerHTML=h;
 }
@@ -776,7 +856,7 @@ function renderCal(){
     const ds=y+'/'+String(m+1).padStart(2,'0')+'/'+String(d).padStart(2,'0');
     const isT=dt.toDateString()===today.toDateString();
     const isP=dt<new Date(today.toDateString());
-    const isS=S.selDate===ds,hasS=shiftDates.includes(ds);
+    const isS=S.selDate===ds,hasS=shiftDates.indexOf(ds)>=0;
     const sch=S.schedule[ds];
     let c='cal-day';
     if(sch&&!isP&&!isT&&!isS){
@@ -786,7 +866,7 @@ function renderCal(){
     }
     if(isP)c+=' cp';else if(isS)c+=' cs';else if(isT)c+=' ct';
     if(hasS)c+=' chs';
-    const timeLabel=sch&&sch.start&&!isP?`<span class="cal-time">${sch.start}</span>`:'';
+    const timeLabel=sch&&sch.start&&!isP?`<span class="cal-time">${esc(sch.start)}</span>`:'';
     const helpStyle=sch&&sch.help&&!isP&&!isT&&!isS?' style="color:#e94560;font-weight:800"':'';
     h+=`<div class="${c}"${isP?'':` onclick="selDate('${ds}')"`}><span${helpStyle}>${d}</span>${timeLabel}</div>`;
   }
@@ -804,10 +884,10 @@ function selDate(ds){
   const detail=document.getElementById('calDayDetail');
   const sch=S.schedule[ds];
   if(sch){
-    const [y,mo,da]=ds.split('/');
+    const parts=ds.split('/');
     const helpBadge=sch.help?'<span class="help-badge">⚠ 要ヘルプ</span>':'';
-    detail.innerHTML=`<div class="day-detail-date">${y}年${+mo}月${+da}日${helpBadge}</div>`+
-      `<div class="day-detail-time">開講時間: ${sch.start||'—'} 〜 ${sch.end||'—'}</div>`;
+    detail.innerHTML=`<div class="day-detail-date">${parts[0]}年${+parts[1]}月${+parts[2]}日${helpBadge}</div>`+
+      `<div class="day-detail-time">開講時間: ${esc(sch.start||'—')} 〜 ${esc(sch.end||'—')}</div>`;
     detail.classList.remove('hidden');
   }else{
     detail.classList.add('hidden');
@@ -816,8 +896,8 @@ function selDate(ds){
 function updShfBtn(){
   const btn=document.getElementById('shfBtn'),info=document.getElementById('calInfo');
   if(S.selDate){
-    const [y,m,d]=S.selDate.split('/');
-    info.textContent=`${y}年${+m}月${+d}日を選択中`;
+    const p=S.selDate.split('/');
+    info.textContent=`${p[0]}年${+p[1]}月${+p[2]}日を選択中`;
     btn.textContent='この日をシフト申請する';btn.disabled=false;
   }else{
     info.textContent='日付をタップして選択してください';
@@ -826,25 +906,31 @@ function updShfBtn(){
 }
 async function submitShift(){
   if(!S.selDate)return;
+  const btn=document.getElementById('shfBtn');
+  btn.disabled=true;
   try{
     await run('addShift',S.name,S.selDate);
     toast('シフトを申請しました','ok');
-    S.selDate=null;await loadShifts();renderCal();updShfBtn();
+    S.selDate=null;
+    S.shifts=await run('getShifts',S.name);
+    renderShifts(); renderCal(); updShfBtn();
     document.getElementById('calDayDetail').classList.add('hidden');
-  }catch(e){toast(e.message,'ng');}
+  }catch(e){
+    toast(e.message,'ng');
+    updShfBtn();
+  }
 }
-async function loadShifts(){
-  S.shifts=await run('getShifts',S.name);
+function renderShifts(){
   const el=document.getElementById('shfList');
   if(!S.shifts.length){el.innerHTML=emptyHTML('📅','申請がありません');return;}
   const sorted=[...S.shifts].sort((a,b)=>b.date.localeCompare(a.date));
-  const helpDates=Object.entries(S.schedule).filter(([,v])=>v.help).map(([k])=>k);
+  const helpDates=Object.keys(S.schedule).filter(k=>S.schedule[k].help);
   el.innerHTML='<div class="rlist">'+sorted.map(s=>{
     const bc=s.status==='承認'?'badge-ok':s.status==='却下'?'badge-ng':'badge-p';
-    const isHelp=helpDates.some(d=>d===s.date||d.replace(/-/g,'/')===s.date.replace(/-/g,'/'));
+    const isHelp=helpDates.some(d=>d.replace(/-/g,'/')===s.date.replace(/-/g,'/'));
     const helpTag=isHelp?`<span style="font-size:16px;color:#e94560;font-weight:700;margin-left:8px">⚠ 要ヘルプ</span>`:'';
     const dateStyle=isHelp?'color:#e94560;font-weight:700':'';
-    return `<div class="ritem"><div class="ritem-main" style="${dateStyle}">${s.date}${helpTag}</div><span class="badge ${bc}">${s.status}</span></div>`;
+    return `<div class="ritem"><div class="ritem-main" style="${dateStyle}">${esc(s.date)}${helpTag}</div><span class="badge ${bc}">${esc(s.status)}</span></div>`;
   }).join('')+'</div>';
 }
 
@@ -859,43 +945,44 @@ async function loadHistoryReports(){
   el.innerHTML=`<div class="empty-state"><div class="empty-icon" style="animation:blink 1s infinite">⏳</div></div>`;
   try{
     const recs=await run('getReportsByStudent',sName);
+    if(document.getElementById('hisStuSel').value!==sName) return;
     if(!recs.length){el.innerHTML=emptyHTML('📋','記録がありません');return;}
-    const sorted=[...recs].sort((a,b)=>b.timestamp.localeCompare(a.timestamp));
+    const sorted=[...recs].sort((a,b)=>String(b.timestamp).localeCompare(String(a.timestamp)));
     el.innerHTML=sorted.map(r=>{
       const rows=[];
       if(r.materials) rows.push(`
         <div class="his-row">
           <div class="his-label">実施教材</div>
-          <div class="his-val accent">${r.materials}</div>
+          <div class="his-val accent">${esc(r.materials)}</div>
         </div>`);
       if(r.homework) rows.push(`
         <div class="his-divider"></div>
         <div class="his-row">
           <div class="his-label">宿題</div>
-          <div class="his-val purple">${r.homework}</div>
+          <div class="his-val purple">${esc(r.homework)}</div>
         </div>`);
       if(r.note) rows.push(`
         <div class="his-divider"></div>
         <div class="his-row">
           <div class="his-label">報告事項</div>
-          <div class="his-val">${r.note}</div>
+          <div class="his-val">${esc(r.note)}</div>
         </div>`);
       if(r.photoUrl) rows.push(`
         <div class="his-divider"></div>
         <div class="his-row">
           <div class="his-label">写真</div>
-          <div class="his-val"><a href="${r.photoUrl}" target="_blank" style="color:var(--ok);font-size:43px">📂 確認</a></div>
+          <div class="his-val"><a href="${esc(r.photoUrl)}" target="_blank" style="color:var(--ok);font-size:43px">📂 確認</a></div>
         </div>`);
       return `
         <div class="his-card">
           <div class="his-header">
-            <div class="his-date">${r.timestamp}</div>
-            <div class="his-teacher">${r.teacherName}</div>
+            <div class="his-date">${esc(r.timestamp)}</div>
+            <div class="his-teacher">${esc(r.teacherName)}</div>
           </div>
           <div class="his-body">${rows.join('')}</div>
         </div>`;
     }).join('');
-  }catch(e){el.innerHTML=emptyHTML('⚠️',e.message);}
+  }catch(e){el.innerHTML=emptyHTML('⚠️',esc(e.message));}
 }
 
 // ── UI ────────────────────────────────────────────────────
@@ -907,6 +994,12 @@ function switchTab(id,el){
 }
 function emptyHTML(ic,msg){
   return `<div class="empty-state"><div class="empty-icon">${ic}</div><div class="empty-text">${msg}</div></div>`;
+}
+// シートの内容がそのままHTMLに入るため、記号によるレイアウト崩れを防ぐ
+function esc(v){
+  return String(v==null?'':v)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 let _tt;
 function toast(msg,type=''){
