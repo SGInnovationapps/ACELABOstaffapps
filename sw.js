@@ -6,7 +6,7 @@
 //  - 画像（ロゴ・アイコン）は「キャッシュ優先」。滅多に変わらず高速。
 //  - GAS API（データ通信）はキャッシュせず常にネットワークへ。
 
-const CACHE_VERSION = 'acelabo-v2';
+const CACHE_VERSION = 'acelabo-v3';
 
 const APP_SHELL = [
   './',
