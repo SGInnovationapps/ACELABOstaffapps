@@ -41,7 +41,7 @@ const READONLY_FNS = [
   'getReportsByStudent','getAttendance','getShifts','getSchedule',
   'getConfirmedShifts','getTestConfig','getTestScores','loginWithEmail'
 ];
-const REQ_TIMEOUT_MS = 30000;
+const REQ_TIMEOUT_MS = 60000;
 
 async function run(fn,...args){
   if(!window.CONFIG || !CONFIG.API_URL || CONFIG.API_URL.includes('YOUR_GAS_URL')){
