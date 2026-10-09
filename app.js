@@ -39,7 +39,8 @@ function handleAuthExpired(message){
 const READONLY_FNS = [
   'bootstrap','selectStudent','getStudents','getTodayReport','getReports',
   'getReportsByStudent','getAttendance','getShifts','getSchedule',
-  'getConfirmedShifts','getTestConfig','getTestScores','loginWithEmail'
+  'getConfirmedShifts','getTestConfig','getTestScores','loginWithEmail',
+  'getShiftBoard'
 ];
 const REQ_TIMEOUT_MS = 60000;
 
@@ -108,8 +109,14 @@ async function _post(fn,args){
 // ── State ─────────────────────────────────────────────────
 const S={
   name:'',email:'',
-  students:[],shifts:[],schedule:{},confirmedShifts:{},
-  calY:new Date().getFullYear(),calM:new Date().getMonth(),selDate:null,
+  students:[],schedule:{},confirmedShifts:{},
+  // シフト（○△×希望方式）
+  shiftOpenMonths:[],   // 希望受付中の月 ["2026/11", ...]
+  shiftDays:{},         // { "yyyy/MM/dd": {start,end,help,open} }
+  shiftPrefs:{},        // 送信済みの希望 { "yyyy/MM/dd": "○"|"△"|"×" }
+  prefDraft:{},         // 未送信の選択
+  prefMonth:'',         // 表示中の月
+  myConfirmed:[],       // 自分の確定日
   editing:false,
   existingPhotoUrl:'',
   testConfig:null,
@@ -178,20 +185,18 @@ function startApp(b){
 
   S.students        = b.students   || [];
   S.schedule        = b.schedule   || {};
-  S.confirmedShifts = b.confirmed  || {};
   S.testConfig      = b.testConfig || null;
-  S.shifts          = b.shifts     || [];
 
   renderStudentOptions();
   applyTestConfig();
   renderAttendance(b.attendance || []);
   renderReports(b.reports || []);
-  renderShifts();
-  renderCal();
-  updShfBtn();
 
   document.getElementById('loading').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
+
+  // シフトは画面表示後に裏で読み込む（起動を遅くしない）
+  loadShiftBoard(true);
 }
 
 function jstToday(){
@@ -803,7 +808,181 @@ async function submitGrade(){
   }
 }
 
-// ── シフト ────────────────────────────────────────────────
+// ── シフト（○△×希望方式） ─────────────────────────────────
+// 流れ：管理者が月を確定 → 講師が日ごとに ○/△/× → 管理者が割当・確定 → 通知
+const SHF_STALE_MS = 3*60*1000;   // シフトタブを開いたとき、これより古ければ再取得
+const PREF_VALUES = ['○','△','×'];
+const PREF_CLASS  = {'○':'maru','△':'sankaku','×':'batsu'};
+const DOW = ['日','月','火','水','木','金','土'];
+let shfLoadedAt = 0, shfLoading = null;
+
+function loadShiftBoard(force){
+  if(shfLoading) return shfLoading;
+  if(!force && shfLoadedAt && Date.now()-shfLoadedAt < SHF_STALE_MS) return Promise.resolve();
+  shfLoading = run('getShiftBoard', S.name).then(b=>{
+    S.shiftOpenMonths = b.openMonths  || [];
+    S.shiftDays       = b.days        || {};
+    S.shiftPrefs      = b.prefs       || {};
+    S.confirmedShifts = b.confirmed   || {};
+    S.myConfirmed     = b.myConfirmed || [];
+    // 未送信の選択は残す。ただし締め切られた日の分は捨てる
+    Object.keys(S.prefDraft).forEach(ds=>{
+      const d = S.shiftDays[ds];
+      if(!d || !d.open || S.shiftPrefs[ds]===S.prefDraft[ds]) delete S.prefDraft[ds];
+    });
+    if(S.shiftOpenMonths.indexOf(S.prefMonth) < 0) S.prefMonth = S.shiftOpenMonths[0] || '';
+    shfLoadedAt = Date.now();
+    renderPrefs();
+    renderCalConf();
+    renderConfList();
+  }).catch(e=>{
+    if(e && e.__auth) return;
+    if(shfLoadedAt){ toast('シフトの更新に失敗しました','ng'); return; }
+    document.getElementById('prefLoading').innerHTML =
+      emptyHTML('⚠️', esc(e.message)) +
+      '<div style="text-align:center;margin-bottom:8px"><button class="btn bs bsm" onclick="retryShiftBoard()">再読み込み</button></div>';
+  }).finally(()=>{ shfLoading = null; });
+  return shfLoading;
+}
+function retryShiftBoard(){
+  document.getElementById('prefLoading').innerHTML =
+    '<div class="empty-icon" style="animation:blink 1s infinite">⏳</div><div class="empty-text">読み込み中...</div>';
+  loadShiftBoard(true);
+}
+
+function prefValue(ds){ return S.prefDraft[ds] || S.shiftPrefs[ds] || ''; }
+function dowOf(ds){ const p=ds.split('/'); return new Date(+p[0],+p[1]-1,+p[2]).getDay(); }
+function monthDates(month){
+  return Object.keys(S.shiftDays)
+    .filter(ds=>S.shiftDays[ds].open && ds.indexOf(month+'/')===0)
+    .sort();
+}
+function openDates(){
+  return S.shiftOpenMonths.reduce((a,m)=>a.concat(monthDates(m)),[]);
+}
+
+function renderPrefs(){
+  const loading=document.getElementById('prefLoading');
+  const none=document.getElementById('prefNoOpen');
+  const sec=document.getElementById('prefSection');
+  loading.classList.add('hidden');
+  if(!S.shiftOpenMonths.length){
+    none.classList.remove('hidden'); sec.classList.add('hidden');
+    updShfDot();
+    return;
+  }
+  none.classList.add('hidden'); sec.classList.remove('hidden');
+  renderPrefTabs();
+
+  const dates = monthDates(S.prefMonth);
+  document.getElementById('prefList').innerHTML = dates.length ? dates.map(ds=>{
+    const d=S.shiftDays[ds], v=prefValue(ds), w=dowOf(ds);
+    const time = d.start ? esc(d.start)+(d.end?'〜'+esc(d.end):'') : '';
+    const btns = PREF_VALUES.map(p=>
+      `<button class="pref-btn ${PREF_CLASS[p]}${v===p?' on':''}" data-v="${p}" onclick="setPref(this)">${p}</button>`
+    ).join('');
+    return `<div class="pref-row${d.help?' help':''}${v?' done':''}" data-ds="${ds}">
+      <div class="pref-date">
+        <div class="pref-d${w===0?' sun':w===6?' sat':''}">${+ds.split('/')[2]}<small>（${DOW[w]}）</small>${d.help?'<span class="help-badge">要ヘルプ</span>':''}</div>
+        ${time?`<div class="pref-t">${time}</div>`:''}
+      </div>
+      <div class="pref-btns">${btns}</div>
+    </div>`;
+  }).join('') : emptyHTML('🗓','この月の開講日はありません');
+  updPrefStatus();
+}
+
+function renderPrefTabs(){
+  document.getElementById('prefMonthTabs').innerHTML = S.shiftOpenMonths.map(m=>{
+    const p=m.split('/');
+    const left=monthDates(m).filter(ds=>!prefValue(ds)).length;
+    return `<button class="pref-mtab${m===S.prefMonth?' on':''}" onclick="selPrefMonth('${m}')">`+
+      `${p[0]}年${+p[1]}月${left?`<span class="pref-mtab-n">未入力 ${left}</span>`:'<span class="pref-mtab-ok">✓</span>'}</button>`;
+  }).join('');
+}
+
+function selPrefMonth(m){
+  S.prefMonth=m;
+  renderPrefs();
+}
+
+function setPref(btn){
+  const row=btn.closest('.pref-row');
+  const ds=row.dataset.ds, v=btn.dataset.v;
+  if(S.shiftPrefs[ds]===v) delete S.prefDraft[ds];   // 送信済みと同じに戻したら未送信扱いにしない
+  else S.prefDraft[ds]=v;
+  row.querySelectorAll('.pref-btn').forEach(b=>b.classList.toggle('on', b.dataset.v===v));
+  row.classList.add('done');
+  renderPrefTabs();
+  updPrefStatus();
+}
+
+// 表示中の月で、まだ選んでいない日だけをまとめて埋める
+function fillPrefs(v){
+  const empty=monthDates(S.prefMonth).filter(ds=>!prefValue(ds));
+  if(!empty.length){ toast('未入力の日はありません'); return; }
+  empty.forEach(ds=>{ S.prefDraft[ds]=v; });
+  renderPrefs();
+  toast(`未入力の${empty.length}日を「${v}」にしました`);
+}
+
+function updPrefStatus(){
+  const dates=monthDates(S.prefMonth);
+  const filled=dates.filter(ds=>prefValue(ds)).length;
+  document.getElementById('prefProgress').textContent = `入力 ${filled} / ${dates.length}日`;
+
+  const dirty=Object.keys(S.prefDraft).length;
+  const left=openDates().filter(ds=>!S.shiftPrefs[ds]).length;
+  const btn=document.getElementById('prefSubmitBtn');
+  const note=document.getElementById('prefNote');
+  if(dirty){
+    btn.disabled=false;
+    btn.textContent=`希望を送信する（${dirty}日分）`;
+    note.className='pref-note warn';
+    note.textContent='まだ送信されていません';
+  }else if(left){
+    btn.disabled=true;
+    btn.textContent=`未入力の日があと${left}日あります`;
+    note.className='pref-note';
+    note.textContent='日ごとに ○ / △ / × を選んでから送信してください';
+  }else{
+    btn.disabled=true;
+    btn.textContent='送信済み';
+    note.className='pref-note';
+    note.textContent='締切までは、選び直して何度でも送信できます';
+  }
+  updShfDot();
+}
+
+// シフトタブの赤い点：未入力の日 or 未送信の選択がある
+function updShfDot(){
+  const dot=document.getElementById('shfDot');
+  if(!dot) return;
+  const need = Object.keys(S.prefDraft).length>0 || openDates().some(ds=>!S.shiftPrefs[ds]);
+  dot.classList.toggle('hidden', !need);
+}
+
+async function submitPrefs(){
+  const prefs=Object.keys(S.prefDraft).sort().map(ds=>({date:ds, pref:S.prefDraft[ds]}));
+  if(!prefs.length) return;
+  const empty=openDates().filter(ds=>!prefValue(ds)).length;
+  if(empty && !confirm(`未入力の日が${empty}日あります。このまま送信しますか？\n（あとから追加で送信できます）`)) return;
+
+  const btn=document.getElementById('prefSubmitBtn');
+  btn.disabled=true; btn.innerHTML='<span class="sp"></span> 送信中...';
+  try{
+    await run('saveShiftPrefs', S.name, prefs);
+    prefs.forEach(p=>{ S.shiftPrefs[p.date]=p.pref; });
+    S.prefDraft={};
+    toast(`${prefs.length}日分の希望を送信しました`,'ok');
+    renderPrefs();
+  }catch(e){
+    toast(e.message,'ng');
+    updPrefStatus();
+    if(/受付が終わって/.test(e.message)) loadShiftBoard(true);
+  }
+}
+
 function switchSubtab(id,el){
   document.querySelectorAll('.subtab').forEach(t=>t.classList.remove('on'));
   document.querySelectorAll('.subtab-content').forEach(t=>t.classList.remove('on'));
@@ -824,8 +1003,7 @@ function renderCalConf(){
   document.getElementById('calTitleConf').textContent=y+'年 '+(m+1)+'月';
   const first=new Date(y,m,1).getDay(),days=new Date(y,m+1,0).getDate();
   const today=new Date();
-  const myLast=(S.name||'').split(/[\s　]/)[0];
-  let h=['日','月','火','水','木','金','土'].map(d=>`<div class="cal-head">${d}</div>`).join('');
+  let h=DOW.map(d=>`<div class="cal-head">${d}</div>`).join('');
   for(let i=0;i<first;i++)h+='<div class="cal-day ce"></div>';
   for(let d=1;d<=days;d++){
     const dt=new Date(y,m,d);
@@ -833,8 +1011,8 @@ function renderCalConf(){
     const isT=dt.toDateString()===today.toDateString();
     const isP=dt<new Date(today.toDateString());
     const names=S.confirmedShifts[ds]||[];
-    const isMine=names.indexOf(myLast)>=0;
-    let c='cal-day';
+    const isMine=S.myConfirmed.indexOf(ds)>=0;
+    let c='cal-day ce';
     if(isP)c+=' cp'; else if(isT)c+=' ct';
     if(isMine)c+=' conf-mine';
     const nameLabels=names.map(n=>`<span class="conf-name">${esc(n)}</span>`).join('');
@@ -843,94 +1021,23 @@ function renderCalConf(){
   document.getElementById('calConf').innerHTML=h;
 }
 
-function renderCal(){
-  const y=S.calY,m=S.calM;
-  document.getElementById('calTitle').textContent=y+'年 '+(m+1)+'月';
-  const first=new Date(y,m,1).getDay(),days=new Date(y,m+1,0).getDate();
-  const today=new Date();
-  const shiftDates=S.shifts.filter(s=>s.status!=='却下').map(s=>s.date.replace(/-/g,'/'));
-  let h=['日','月','火','水','木','金','土'].map(d=>`<div class="cal-head">${d}</div>`).join('');
-  for(let i=0;i<first;i++)h+='<div class="cal-day ce"></div>';
-  for(let d=1;d<=days;d++){
-    const dt=new Date(y,m,d);
-    const ds=y+'/'+String(m+1).padStart(2,'0')+'/'+String(d).padStart(2,'0');
-    const isT=dt.toDateString()===today.toDateString();
-    const isP=dt<new Date(today.toDateString());
-    const isS=S.selDate===ds,hasS=shiftDates.indexOf(ds)>=0;
-    const sch=S.schedule[ds];
-    let c='cal-day';
-    if(sch&&!isP&&!isT&&!isS){
-      if(sch.help)c+=' s-help';
-      else if(sch.start==='11:00')c+=' s-1100';
-      else if(sch.start==='16:30')c+=' s-1630';
-    }
-    if(isP)c+=' cp';else if(isS)c+=' cs';else if(isT)c+=' ct';
-    if(hasS)c+=' chs';
-    const timeLabel=sch&&sch.start&&!isP?`<span class="cal-time">${esc(sch.start)}</span>`:'';
-    const helpStyle=sch&&sch.help&&!isP&&!isT&&!isS?' style="color:#e94560;font-weight:800"':'';
-    h+=`<div class="${c}"${isP?'':` onclick="selDate('${ds}')"`}><span${helpStyle}>${d}</span>${timeLabel}</div>`;
-  }
-  document.getElementById('cal').innerHTML=h;
-}
-function mvMonth(d){
-  S.calM+=d;
-  if(S.calM>11){S.calM=0;S.calY++;}
-  if(S.calM<0){S.calM=11;S.calY--;}
-  S.selDate=null;renderCal();updShfBtn();
-  document.getElementById('calDayDetail').classList.add('hidden');
-}
-function selDate(ds){
-  S.selDate=ds;renderCal();updShfBtn();
-  const detail=document.getElementById('calDayDetail');
-  const sch=S.schedule[ds];
-  if(sch){
-    const parts=ds.split('/');
-    const helpBadge=sch.help?'<span class="help-badge">⚠ 要ヘルプ</span>':'';
-    detail.innerHTML=`<div class="day-detail-date">${parts[0]}年${+parts[1]}月${+parts[2]}日${helpBadge}</div>`+
-      `<div class="day-detail-time">開講時間: ${esc(sch.start||'—')} 〜 ${esc(sch.end||'—')}</div>`;
-    detail.classList.remove('hidden');
-  }else{
-    detail.classList.add('hidden');
-  }
-}
-function updShfBtn(){
-  const btn=document.getElementById('shfBtn'),info=document.getElementById('calInfo');
-  if(S.selDate){
-    const p=S.selDate.split('/');
-    info.textContent=`${p[0]}年${+p[1]}月${+p[2]}日を選択中`;
-    btn.textContent='この日をシフト申請する';btn.disabled=false;
-  }else{
-    info.textContent='日付をタップして選択してください';
-    btn.textContent='日付を選択してください';btn.disabled=true;
-  }
-}
-async function submitShift(){
-  if(!S.selDate)return;
-  const btn=document.getElementById('shfBtn');
-  btn.disabled=true;
-  try{
-    await run('addShift',S.name,S.selDate);
-    toast('シフトを申請しました','ok');
-    S.selDate=null;
-    S.shifts=await run('getShifts',S.name);
-    renderShifts(); renderCal(); updShfBtn();
-    document.getElementById('calDayDetail').classList.add('hidden');
-  }catch(e){
-    toast(e.message,'ng');
-    updShfBtn();
-  }
-}
-function renderShifts(){
-  const el=document.getElementById('shfList');
-  if(!S.shifts.length){el.innerHTML=emptyHTML('📅','申請がありません');return;}
-  const sorted=[...S.shifts].sort((a,b)=>b.date.localeCompare(a.date));
-  const helpDates=Object.keys(S.schedule).filter(k=>S.schedule[k].help);
-  el.innerHTML='<div class="rlist">'+sorted.map(s=>{
-    const bc=s.status==='承認'?'badge-ok':s.status==='却下'?'badge-ng':'badge-p';
-    const isHelp=helpDates.some(d=>d.replace(/-/g,'/')===s.date.replace(/-/g,'/'));
-    const helpTag=isHelp?`<span style="font-size:16px;color:#e94560;font-weight:700;margin-left:8px">⚠ 要ヘルプ</span>`:'';
-    const dateStyle=isHelp?'color:#e94560;font-weight:700':'';
-    return `<div class="ritem"><div class="ritem-main" style="${dateStyle}">${esc(s.date)}${helpTag}</div><span class="badge ${bc}">${esc(s.status)}</span></div>`;
+// 自分の確定シフト（今日以降）
+function renderConfList(){
+  const el=document.getElementById('confList');
+  const today=jstToday();
+  const mine=S.myConfirmed.filter(ds=>ds>=today).sort();
+  if(!mine.length){ el.innerHTML=emptyHTML('📅','これからの確定シフトはありません'); return; }
+  el.innerHTML='<div class="rlist">'+mine.map(ds=>{
+    const d=S.shiftDays[ds]||S.schedule[ds]||{};
+    const p=ds.split('/'), w=dowOf(ds);
+    const time=d.start?esc(d.start)+(d.end?'〜'+esc(d.end):''):'';
+    return `<div class="ritem">
+      <div>
+        <div class="ritem-main">${+p[1]}月${+p[2]}日（${DOW[w]}）${d.help?'<span class="help-badge">要ヘルプ</span>':''}</div>
+        ${time?`<div class="ritem-sub">${time}</div>`:''}
+      </div>
+      <span class="badge badge-ok">確定</span>
+    </div>`;
   }).join('')+'</div>';
 }
 
@@ -991,6 +1098,7 @@ function switchTab(id,el){
   document.querySelectorAll('.ti').forEach(t=>t.classList.remove('on'));
   document.getElementById('tab-'+id).classList.add('on');
   el.classList.add('on');
+  if(id==='shf') loadShiftBoard(false);   // 古ければ最新の受付状況を取り直す
 }
 function emptyHTML(ic,msg){
   return `<div class="empty-state"><div class="empty-icon">${ic}</div><div class="empty-text">${msg}</div></div>`;

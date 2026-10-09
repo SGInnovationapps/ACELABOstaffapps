@@ -258,25 +258,29 @@
       </div>
 
       <div id="subtab-hope-content" class="subtab-content on">
-        <div class="card card-pad" style="margin-top:12px">
-          <div class="cal-nav">
-            <button class="cal-nav-btn" onclick="mvMonth(-1)">‹</button>
-            <span class="cal-title" id="calTitle"></span>
-            <button class="cal-nav-btn" onclick="mvMonth(1)">›</button>
+        <div id="prefLoading" class="empty-state"><div class="empty-icon" style="animation:blink 1s infinite">⏳</div><div class="empty-text">読み込み中...</div></div>
+        <div id="prefNoOpen" class="hidden">
+          <div class="card" style="margin-top:12px">
+            <div class="empty-state"><div class="empty-icon">🗓</div><div class="empty-text">いま希望を受け付けている月はありません</div></div>
           </div>
-          <div class="cal-grid" id="cal"></div>
-          <div class="cal-legend">
-            <div class="legend-item"><div class="legend-dot" style="background:#fff9e0"></div>16:30開講</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#fde8e8"></div>11:00開講</div>
-            <div class="legend-item"><div class="legend-dot" style="background:#ffe5cc"></div>要ヘルプ</div>
-          </div>
-          <div id="calDayDetail" class="hidden day-detail"></div>
-          <div id="calInfo" style="font-size:13px;color:var(--mu);text-align:center;margin:8px 0 12px"></div>
-          <button class="btn bp" id="shfBtn" onclick="submitShift()" disabled>日付を選択してください</button>
         </div>
-        <p class="sec-title">申請済みシフト</p>
-        <div class="card">
-          <div id="shfList"><div class="empty-state"><div class="empty-icon">📅</div><div class="empty-text">申請がありません</div></div></div>
+        <div id="prefSection" class="hidden">
+          <div class="card card-pad" style="margin-top:12px">
+            <div class="pref-month-tabs" id="prefMonthTabs"></div>
+            <div class="pref-head">
+              <span class="pref-progress" id="prefProgress"></span>
+              <div class="pref-bulk">
+                <span class="pref-bulk-lbl">まとめて</span>
+                <button class="pref-bulk-btn maru" onclick="fillPrefs('○')">○</button>
+                <button class="pref-bulk-btn sankaku" onclick="fillPrefs('△')">△</button>
+                <button class="pref-bulk-btn batsu" onclick="fillPrefs('×')">×</button>
+              </div>
+            </div>
+            <div class="pref-legend">○ 入れる　△ 調整すれば入れる　× 入れない</div>
+            <div class="pref-list" id="prefList"></div>
+            <button class="btn bp" id="prefSubmitBtn" onclick="submitPrefs()" style="margin-top:8px">希望を送信する</button>
+            <div class="pref-note" id="prefNote"></div>
+          </div>
         </div>
       </div>
 
@@ -292,6 +296,10 @@
             <div class="legend-item"><div class="legend-dot" style="background:#d1e7dd"></div>自分が入っている日</div>
           </div>
         </div>
+        <p class="sec-title">自分の確定シフト</p>
+        <div class="card">
+          <div id="confList"><div class="empty-state"><div class="empty-icon">📅</div><div class="empty-text">確定したシフトはありません</div></div></div>
+        </div>
       </div>
     </div>
 
@@ -301,7 +309,7 @@
     <button class="ti on" onclick="switchTab('rep',this)"><span class="tic">📝</span>指導報告</button>
     <button class="ti"    onclick="switchTab('att',this)"><span class="tic">⏱</span>出退勤</button>
     <button class="ti"    onclick="switchTab('his',this)"><span class="tic">📋</span>報告一覧</button>
-    <button class="ti"    onclick="switchTab('shf',this)"><span class="tic">📅</span>シフト</button>
+    <button class="ti"    onclick="switchTab('shf',this)"><span class="tic">📅</span>シフト<span class="ti-dot hidden" id="shfDot"></span></button>
   </nav>
 </div>
 

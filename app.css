@@ -430,3 +430,57 @@ textarea.fc{resize:vertical;min-height:35.2px}
 .grade-form-section{
   margin-top:5.6px;padding-top:5.6px;border-top:1.5px solid var(--bd);
 }
+
+/* ── シフト希望（○△×） ── */
+.ti{position:relative}
+.ti-dot{
+  position:absolute;top:5px;left:calc(50% + 12px);
+  width:8px;height:8px;border-radius:50%;background:var(--acc);
+}
+.pref-month-tabs{display:flex;gap:3.2px;flex-wrap:wrap;margin-bottom:5.6px}
+.pref-mtab{
+  flex:1;min-width:0;padding:6.4px 4px;border:1.5px solid var(--bd);border-radius:5.6px;
+  background:var(--bg);font-family:inherit;font-size:18px;font-weight:700;color:var(--mu);
+  cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:1px;
+}
+.pref-mtab.on{border-color:var(--acc);background:#fff5f7;color:var(--tx)}
+.pref-mtab-n{font-size:12.8px;color:var(--acc);font-weight:700}
+.pref-mtab-ok{font-size:12.8px;color:var(--ok);font-weight:700}
+
+.pref-head{display:flex;align-items:center;justify-content:space-between;gap:4px;margin-bottom:2.4px}
+.pref-progress{font-size:16.4px;font-weight:700;color:var(--pri)}
+.pref-bulk{display:flex;align-items:center;gap:3.2px}
+.pref-bulk-lbl{font-size:12.8px;color:var(--mu)}
+.pref-bulk-btn{
+  width:30px;height:30px;border:1.5px solid var(--bd);border-radius:6px;background:#fff;
+  font-family:inherit;font-size:16px;font-weight:700;cursor:pointer;color:var(--mu);
+}
+.pref-bulk-btn:active{opacity:.6}
+.pref-legend{font-size:12.8px;color:var(--mu);margin-bottom:4.8px}
+
+.pref-list{display:flex;flex-direction:column;gap:3.2px}
+.pref-row{
+  display:flex;align-items:center;justify-content:space-between;gap:4px;
+  padding:5.6px 6.4px;border-radius:6.4px;background:var(--bg);
+  border:1.5px solid transparent;
+}
+.pref-row:not(.done){border-color:rgba(233,69,96,.35);background:#fff}
+.pref-row.help{background:#fff8f0}
+.pref-date{min-width:0}
+.pref-d{font-size:21.2px;font-weight:700;line-height:1.2;color:var(--tx)}
+.pref-d small{font-size:14.4px;font-weight:600;margin-left:1px}
+.pref-d.sun{color:#d33}
+.pref-d.sat{color:#2a6fdb}
+.pref-t{font-size:14.4px;color:var(--mu);margin-top:1px}
+.pref-btns{display:flex;gap:4px;flex-shrink:0}
+.pref-btn{
+  width:44px;height:44px;border-radius:8px;border:1.5px solid var(--bd);background:#fff;
+  font-family:inherit;font-size:22px;font-weight:700;color:#c7c7cc;cursor:pointer;
+  transition:background .12s,border-color .12s,color .12s;
+}
+.pref-btn:active{transform:scale(.94)}
+.pref-btn.maru.on{background:#d1e7dd;border-color:var(--ok);color:#0a5c36}
+.pref-btn.sankaku.on{background:#fff3cd;border-color:#d4a106;color:#856404}
+.pref-btn.batsu.on{background:#e9e9ee;border-color:#8e8e93;color:#48484a}
+.pref-note{font-size:14.4px;color:var(--mu);text-align:center;margin-top:4px;min-height:18px}
+.pref-note.warn{color:var(--acc);font-weight:700}
